@@ -3,7 +3,8 @@ import os
 from tqdm import tqdm
 import argparse
 from utils import *
-from datasets import MNIST, Kink, Cifar10, Slab, SlabLinear, SlabNonlinear4
+from transformer_models import TransformerModels
+from datasets import MNIST, Kink, Cifar10, Slab, SlabLinear, SlabNonlinear4, CountingSequences
 from fastargs import Section, Param, get_current_config
 from fastargs.validation import OneOf
 from fastargs.decorators import param, section
@@ -13,7 +14,7 @@ import json
 from sql import *
 
 Section("dataset", "Dataset parameters").params(
-    name=Param(str, OneOf(("mnist", "kink", "cifar10", "slab", "slab_nonlinear_3", "slab_nonlinear_4", "slab_linear")), default="kink"),
+    name=Param(str, OneOf(("mnist", "kink", "cifar10", "slab", "slab_nonlinear_3", "slab_nonlinear_4", "slab_linear", "counting")), default="kink"),
 )
 Section("dataset.kink", "Dataset parameters for kink").enable_if(
     lambda cfg: cfg['dataset.name'] == 'kink'
@@ -25,7 +26,7 @@ Section("dataset.mnistcifar", "Dataset parameters for mnist/cifar").params(
     num_classes=Param(int)
 )
 Section("model", "Model architecture parameters").params(
-    arch=Param(str, OneOf(("mlp", "lenet")), default="mlp"),
+    arch=Param(str, OneOf(("mlp", "lenet", "transformer")), default="mlp"),
     model_count_times_batch_size=Param(int, default=20000*16),
     init=Param(str, OneOf(("uniform", "regular", "uniform2", "uniform5", "sphere100", "sphere200")), default="uniform")
 )
@@ -36,6 +37,15 @@ Section("model.lenet", "Model architecture parameters").params(
 Section("model.mlp", "Model architecture parameters").enable_if(lambda cfg: cfg['model.arch'] == 'mlp').params(
     hidden_units=Param(int),
     layers=Param(int)
+)
+Section("model.transformer", "Model architecture parameters").enable_if(lambda cfg: cfg['model.arch'] == 'transformer').params(
+    vocab_size=Param(int, default=110),
+    d_model=Param(int, default=32),
+    n_layers=Param(int, default=2),
+    n_heads=Param(int, default=4),
+    d_ff=Param(int, default=64),
+    max_len=Param(int, default=32),
+    dropout=Param(float, default=0.1)
 )
 Section("optimizer").params(
     name=Param(str, OneOf(["SGD", "SGDPoison", "Adam", "RMSProp", "guess", "GD"]), default='guess'),
@@ -120,6 +130,31 @@ def get_dataset(name, num_samples, seed, num_classes=None, noise=None, margin=0.
         test_data = train_data
         test_labels = train_labels
         test_all_data, test_all_labels = train_data, train_labels
+    elif name == "counting":
+        # Counting sequences for transformer training
+        train_dataset = CountingSequences(train=True, samples=num_samples, seed=seed, 
+                                        min_range_size=1, max_range_size=10, vocab_size=50, max_len=32)
+        test_dataset = CountingSequences(train=False, samples=num_samples, seed=seed,
+                                       min_range_size=1, max_range_size=10, vocab_size=50, max_len=32) 
+        
+        # Convert to tensors and move to GPU
+        train_data, train_labels = [], []
+        for i in range(len(train_dataset)):
+            x, y = train_dataset[i]
+            train_data.append(x)
+            train_labels.append(y)
+        train_data = torch.stack(train_data).cuda()
+        train_labels = torch.stack(train_labels).cuda()
+        
+        test_data, test_labels = [], []
+        for i in range(len(test_dataset)):
+            x, y = test_dataset[i]
+            test_data.append(x)
+            test_labels.append(y)
+        test_data = torch.stack(test_data).cuda()
+        test_labels = torch.stack(test_labels).cuda()
+        
+        test_all_data, test_all_labels = test_data, test_labels
     return train_data, train_labels, test_data, test_labels, test_all_data, test_all_labels
 
 
@@ -140,6 +175,17 @@ def get_model(arch, model_count, device):
         model = LinearModels(input_dim=(28*28 if config['dataset.name'] == "mnist" else 32*32*3),
                              output_dim=config['dataset.mnistcifar.num_classes'],
                           model_count=model_count, device=device)
+    elif arch == "transformer":
+        model = TransformerModels(
+            vocab_size=config['model.transformer.vocab_size'],
+            d_model=config['model.transformer.d_model'], 
+            n_layers=config['model.transformer.n_layers'],
+            n_heads=config['model.transformer.n_heads'],
+            d_ff=config['model.transformer.d_ff'],
+            max_len=config['model.transformer.max_len'],
+            model_count=model_count,
+            device=device
+        ).to(device)
     return model
 
 

@@ -471,6 +471,106 @@ class SlabLinear(Dataset):
     def __getitem__(self, index):
         return self.data[index].astype(np.float32), self.labels[index].astype(np.int64)
 
+
+class CountingSequences(Dataset):
+    """
+    Dataset for counting sequences task for transformer models.
+    
+    Generates sequences of the form: [min_val, max_val, sep_token, min_val, min_val+1, ..., max_val]
+    This is used for next-token prediction training where the model learns to count from min to max.
+    
+    Example sequences:
+    - Input: [2, 5] -> Full sequence: [2, 5, 102, 2, 3, 4, 5] 
+    - Input: [7, 9] -> Full sequence: [7, 9, 102, 7, 8, 9]
+    
+    The model is trained to predict the next token given the sequence so far.
+    """
+    
+    def __init__(self, train=True, samples=1000, seed=42, min_range_size=1, max_range_size=10, 
+                 vocab_size=50, sep_token=102, pad_token=103, max_len=32):
+        """
+        Args:
+            train: Whether this is training or test data
+            samples: Number of sequences to generate  
+            seed: Random seed for reproducibility
+            min_range_size: Minimum size of counting range
+            max_range_size: Maximum size of counting range  
+            vocab_size: Size of vocabulary (should be larger than max values)
+            sep_token: Token used to separate input from output
+            pad_token: Token used for padding sequences
+            max_len: Maximum sequence length
+        """
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        
+        self.sep_token = sep_token
+        self.pad_token = pad_token
+        self.max_len = max_len
+        self.vocab_size = vocab_size
+        
+        # Generate sequences
+        sequences = []
+        labels = []  # For next-token prediction (shifted sequences)
+        
+        for _ in range(samples):
+            # Sample range size
+            range_size = np.random.randint(min_range_size, max_range_size + 1)
+            
+            # Sample min_val ensuring max_val stays within vocab_size  
+            max_possible_min = vocab_size - range_size - 1  # Leave room for sep/pad tokens
+            min_val = np.random.randint(0, max_possible_min)
+            max_val = min_val + range_size
+            
+            # Create input part: [min_val, max_val] 
+            input_seq = [min_val, max_val]
+            
+            # Create output part: counting from min_val to max_val
+            output_seq = list(range(min_val, max_val + 1))
+            
+            # Full sequence: [input] + [sep_token] + [output]
+            full_seq = input_seq + [sep_token] + output_seq
+            
+            # Pad or truncate to max_len
+            if len(full_seq) > max_len:
+                full_seq = full_seq[:max_len]
+            else:
+                # Pad with pad_token
+                full_seq = full_seq + [pad_token] * (max_len - len(full_seq))
+            
+            # For next-token prediction: input = seq[:-1], target = seq[1:]
+            input_seq_final = full_seq[:-1]
+            target_seq_final = full_seq[1:]
+            
+            sequences.append(input_seq_final)
+            labels.append(target_seq_final)
+        
+        # Split into train/test (70/30 split like other datasets)
+        train_count = int(samples * 0.7)
+        if train:
+            self.data = sequences[:train_count]
+            self.labels = labels[:train_count]
+        else:
+            self.data = sequences[train_count:]
+            self.labels = labels[train_count:]
+            
+        # Convert to numpy arrays
+        self.data = np.array(self.data)
+        self.labels = np.array(self.labels)
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, index):
+        """
+        Returns:
+            input_seq: Input sequence for next-token prediction (seq_len,)
+            target_seq: Target sequence (next tokens to predict) (seq_len,)
+        """
+        return (
+            torch.tensor(self.data[index], dtype=torch.long),
+            torch.tensor(self.labels[index], dtype=torch.long)
+        )
+
 if __name__ == "__main__":
     # plotting slab datasets
     import matplotlib.pyplot as plt

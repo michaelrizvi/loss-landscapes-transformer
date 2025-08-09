@@ -1,0 +1,31 @@
+# Configuration for counting task with transformer models
+dataset:
+  name: counting
+
+model:
+  arch: transformer
+  model_count_times_batch_size: 1000  # 20 models * 50 batch size = total 1000
+  init: regular
+
+model.transformer:
+  vocab_size: 110
+  d_model: 32
+  n_layers: 2  
+  n_heads: 4
+  d_ff: 64
+  max_len: 32
+  dropout: 0.1
+
+optimizer:
+  name: PatternSearchFast
+  epochs: 100
+  es_acc: 0.95  # Stop when 95% accuracy reached
+  
+distributed:
+  loss_thres: "0.1,0.3,0.5,1.0"
+  num_samples: "50,100"
+  target_model_count_subrun: 5
+
+output:
+  target_model_count: 5
+  folder: "counting_transformer_results"
