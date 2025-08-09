@@ -16,9 +16,14 @@ def calculate_loss_acc(data, labels, model, loss_func, batch_size=None):
             pred_cur = model(data[i:min(i+batch_size, len(data))])
             pred.append(pred_cur)
         pred = torch.cat(pred, dim=0)
-    n, m, o = pred.shape
-    loss = loss_func(pred.view(n * m, o), labels.repeat_interleave(m)).view(n, m).mean(dim=0)
-    acc = (pred.view(n * m, o).argmax(dim=1) == labels.repeat_interleave(m)).view(n, m).float().mean(dim=0)
+    if len(pred.shape) == 4:  # Transformer case: (batch_size, model_count, seq_len, vocab_size)
+        n, m, t, o = pred.shape
+        loss = loss_func(pred.view(n * m * t, o), labels.repeat(1, m).view(-1)).view(n, m, t).mean(dim=(0, 2))
+        acc = (pred.view(n * m * t, o).argmax(dim=1) == labels.repeat(1, m).view(-1)).view(n, m, t).float().mean(dim=(0, 2))
+    else:  # Original case: (batch_size, model_count, output_dim)
+        n, m, o = pred.shape
+        loss = loss_func(pred.view(n * m, o), labels.repeat_interleave(m)).view(n, m).mean(dim=0)
+        acc = (pred.view(n * m, o).argmax(dim=1) == labels.repeat_interleave(m)).view(n, m).float().mean(dim=0)
     return loss, acc
 
 
