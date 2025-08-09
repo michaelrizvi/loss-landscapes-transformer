@@ -61,6 +61,7 @@ def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_si
         for batch_idx in range(n):
             # Find separator position in the input sequence for this batch item
             input_seq = data[batch_idx]  # Input sequence for this batch item
+            target_seq = labels[batch_idx]  # Target sequence for this batch item
             sep_positions = (input_seq == sep_token).nonzero(as_tuple=True)[0]
             
             if len(sep_positions) > 0:
@@ -74,7 +75,6 @@ def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_si
                     counting_start = sep_pos  # Fallback to input position
                 
                 # Find where counting ends (before padding)
-                target_seq = labels[batch_idx]
                 counting_end = t  # Default to end of sequence
                 pad_positions = (target_seq == pad_token).nonzero(as_tuple=True)[0]
                 if len(pad_positions) > 0:
