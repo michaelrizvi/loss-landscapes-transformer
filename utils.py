@@ -51,12 +51,10 @@ def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_si
         # Loss computation
         loss = loss_func(pred.view(n * m * t, o), labels.repeat(1, m).view(-1)).view(n, m, t).mean(dim=(0, 2))
         
-        # Token-level accuracy
+        # Token-level and exact match accuracy: only check counting output after separator
         token_correct = (pred.view(n * m * t, o).argmax(dim=1) == labels.repeat(1, m).view(-1)).view(n, m, t)
-        token_acc = token_correct.float().mean(dim=(0, 2))  # Average over batch and sequence
-        
-        # Exact match accuracy: only check counting output after separator
         exact_match_correct_list = []
+        token_acc_list = []
         
         for batch_idx in range(n):
             # Find separator position in the input sequence for this batch item
@@ -82,17 +80,25 @@ def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_si
                 
                 # Check if counting part is correct for each model
                 if counting_start < counting_end:
-                    counting_correct = token_correct[batch_idx, :, counting_start:counting_end].all(dim=1)
+                    counting_token_correct = token_correct[batch_idx, :, counting_start:counting_end]
+                    counting_exact_correct = counting_token_correct.all(dim=1)  # All tokens correct
+                    counting_token_acc = counting_token_correct.float().mean(dim=1)  # Average token accuracy
                 else:
-                    counting_correct = torch.ones(m, dtype=torch.bool, device=token_correct.device)  # Empty counting = correct
+                    counting_exact_correct = torch.ones(m, dtype=torch.bool, device=token_correct.device)  # Empty counting = correct
+                    counting_token_acc = torch.ones(m, dtype=torch.float, device=token_correct.device)  # Empty counting = 100%
             else:
                 # No separator found, consider the entire sequence (fallback)
-                counting_correct = token_correct[batch_idx, :, :].all(dim=1)
+                counting_exact_correct = token_correct[batch_idx, :, :].all(dim=1)
+                counting_token_acc = token_correct[batch_idx, :, :].float().mean(dim=1)
             
-            exact_match_correct_list.append(counting_correct)
+            exact_match_correct_list.append(counting_exact_correct)
+            token_acc_list.append(counting_token_acc)
         
         exact_match_correct = torch.stack(exact_match_correct_list, dim=0)  # (n, m)
         exact_match_acc = exact_match_correct.float().mean(dim=0)  # Average over batch
+        
+        token_acc_per_batch = torch.stack(token_acc_list, dim=0)  # (n, m)
+        token_acc = token_acc_per_batch.mean(dim=0)  # Average over batch
         
     else:  # Original case: (batch_size, model_count, output_dim)
         n, m, o = pred.shape
