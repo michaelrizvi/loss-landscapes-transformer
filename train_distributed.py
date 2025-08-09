@@ -607,6 +607,18 @@ if __name__ == "__main__":
                         "dataset": config['dataset.name'],
                         "feature_dim": config['model.lenet.feature_dim']}
                 new_models = LeNetModels(**kwargs)
+                
+            elif config['model.arch'] == "transformer":
+                from transformer_models import TransformerModels
+                kwargs = {"vocab_size": config['model.transformer.vocab_size'],
+                        "d_model": config['model.transformer.d_model'],
+                        "n_layers": config['model.transformer.n_layers'],
+                        "n_heads": config['model.transformer.n_heads'],
+                        "d_ff": config['model.transformer.d_ff'],
+                        "max_len": config['model.transformer.max_len'],
+                        "dropout": config['model.transformer.dropout'],
+                        "model_count": target_model_count_subrun}
+                new_models = TransformerModels(**kwargs, device=torch.device('cpu'))
 
             new_models.load_state_dict(good_models_state_dict)
             # show norm of the model
@@ -635,6 +647,30 @@ if __name__ == "__main__":
             saveconfig['training.seed'] = training_seed
             saveconfig['dataset.seed'] = data_seed
             saveconfig['training.es_l'], saveconfig['training.es_u'] = cur_loss_bin
+            
+            # Length generalization testing (for transformer models only)
+            if config['model.arch'] == 'transformer':
+                from datasets import create_length_generalization_data
+                
+                with torch.no_grad():
+                    # Create longer sequences (length 10-20) for testing generalization
+                    long_data, long_labels = create_length_generalization_data(
+                        min_range_size=10, max_range_size=20, samples=200, 
+                        vocab_size=config['model.transformer.vocab_size'],
+                        max_len=config['model.transformer.max_len']
+                    )
+                    
+                    # Test on longer sequences
+                    long_test_loss, long_test_acc = calculate_loss_acc(
+                        long_data.cpu(), long_labels.cpu(), new_models, loss_func, batch_size=1
+                    )
+                    
+                    print(f"Length generalization (10-20) acc: {long_test_acc.mean().item(): 0.3f} ({long_test_acc.max().item(): 0.3f} , {long_test_acc.min().item(): 0.3f} )")
+                    
+                    # Store the length generalization results in config for saving
+                    saveconfig['length_gen_acc_mean'] = long_test_acc.mean().item()
+                    saveconfig['length_gen_acc_max'] = long_test_acc.max().item()
+                    saveconfig['length_gen_acc_min'] = long_test_acc.min().item()
 
             # save the model
             torch.save({"kwargs": kwargs,

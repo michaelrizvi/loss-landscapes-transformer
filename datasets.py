@@ -571,6 +571,65 @@ class CountingSequences(Dataset):
             torch.tensor(self.labels[index], dtype=torch.long)
         )
 
+def create_length_generalization_data(min_range_size=10, max_range_size=20, samples=200, 
+                                     vocab_size=110, sep_token=102, pad_token=103, max_len=32, seed=42):
+    """
+    Create test data for length generalization with longer counting sequences.
+    
+    Args:
+        min_range_size: Minimum size of counting range (e.g., 10)
+        max_range_size: Maximum size of counting range (e.g., 20) 
+        samples: Number of test sequences to generate
+        vocab_size: Size of vocabulary
+        sep_token: Token used to separate input from output
+        pad_token: Token used for padding sequences
+        max_len: Maximum sequence length (should be larger for longer sequences)
+        seed: Random seed for reproducibility
+        
+    Returns:
+        tuple: (input_sequences, target_sequences) as torch tensors
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    sequences = []
+    labels = []
+    
+    for _ in range(samples):
+        # Sample range size from 10-20
+        range_size = np.random.randint(min_range_size, max_range_size + 1)
+        
+        # Sample min_val ensuring max_val stays within vocab_size  
+        max_possible_min = vocab_size - range_size - 3  # Leave room for sep/pad tokens
+        min_val = np.random.randint(0, max_possible_min)
+        max_val = min_val + range_size - 1  # -1 because range_size includes both endpoints
+        
+        # Create input part: [min_val, max_val] 
+        input_seq = [min_val, max_val]
+        
+        # Create output part: counting from min_val to max_val
+        output_seq = list(range(min_val, max_val + 1))
+        
+        # Full sequence: [input] + [sep_token] + [output]
+        full_seq = input_seq + [sep_token] + output_seq
+        
+        # Pad or truncate to max_len
+        if len(full_seq) > max_len:
+            full_seq = full_seq[:max_len]
+        else:
+            # Pad with pad_token
+            full_seq = full_seq + [pad_token] * (max_len - len(full_seq))
+        
+        # For next-token prediction: input = seq[:-1], target = seq[1:]
+        input_seq_final = full_seq[:-1]
+        target_seq_final = full_seq[1:]
+        
+        sequences.append(input_seq_final)
+        labels.append(target_seq_final)
+    
+    return torch.tensor(sequences, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+
+
 if __name__ == "__main__":
     # plotting slab datasets
     import matplotlib.pyplot as plt
