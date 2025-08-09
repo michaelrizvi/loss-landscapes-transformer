@@ -297,13 +297,6 @@ class TransformerModels(nn.Module):
 
             # Modify each model at one parameter location
             for i in range(1, self.model_count):
-                if self.curr_idx >= len(self.basis_list):
-                    print("Pattern search: went over all parameters")
-                    random.shuffle(self.basis_list)
-                    self.radius /= 2
-                    self.curr_idx = 0
-                    break
-                
                 para, p_i, op = self.basis_list[self.curr_idx]
                 if op == "+":
                     para[i, p_i] += self.radius
@@ -360,7 +353,7 @@ class TransformerModels(nn.Module):
                 
                 loss = loss_func(
                     pred.reshape(n * m * t, o), 
-                    y.repeat_interleave(m * t)
+                    y.repeat(1, m).view(-1)
                 ).view(n, m, t).mean(dim=(0, 2))
 
                 best_idx = loss.min(dim=0).indices
