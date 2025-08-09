@@ -65,8 +65,13 @@ def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_si
             
             if len(sep_positions) > 0:
                 sep_pos = sep_positions[0].item()  # Position of separator in input
-                # The counting output starts at sep_pos + 1 in the target sequence
-                counting_start = sep_pos + 1
+                # Find separator in target sequence (it's shifted by -1 due to next-token prediction)
+                target_sep_positions = (target_seq == sep_token).nonzero(as_tuple=True)[0]
+                if len(target_sep_positions) > 0:
+                    target_sep_pos = target_sep_positions[0].item()
+                    counting_start = target_sep_pos + 1  # Start after separator in target
+                else:
+                    counting_start = sep_pos  # Fallback to input position
                 
                 # Find where counting ends (before padding)
                 target_seq = labels[batch_idx]
