@@ -26,6 +26,47 @@ def calculate_loss_acc(data, labels, model, loss_func, batch_size=None):
         acc = (pred.view(n * m, o).argmax(dim=1) == labels.repeat_interleave(m)).view(n, m).float().mean(dim=0)
     return loss, acc
 
+def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_size=None):
+    """
+    Calculate loss, token-level accuracy, and exact match accuracy.
+    
+    Returns:
+        loss: Loss per model
+        token_acc: Token-level accuracy per model  
+        exact_match_acc: Exact match (sequence-level) accuracy per model
+    """
+    if batch_size is None:
+        pred = model(data)  # pred.shape = (# of examples, # model counts , output_dim)
+    else:
+        pred = []
+        for i in range(0, len(data), batch_size):
+            pred_cur = model(data[i:min(i+batch_size, len(data))])
+            pred.append(pred_cur)
+        pred = torch.cat(pred, dim=0)
+        
+    if len(pred.shape) == 4:  # Transformer case: (batch_size, model_count, seq_len, vocab_size)
+        n, m, t, o = pred.shape
+        
+        # Loss computation
+        loss = loss_func(pred.view(n * m * t, o), labels.repeat(1, m).view(-1)).view(n, m, t).mean(dim=(0, 2))
+        
+        # Token-level accuracy
+        token_correct = (pred.view(n * m * t, o).argmax(dim=1) == labels.repeat(1, m).view(-1)).view(n, m, t)
+        token_acc = token_correct.float().mean(dim=(0, 2))  # Average over batch and sequence
+        
+        # Exact match accuracy: all tokens in sequence must be correct
+        exact_match_correct = token_correct.all(dim=2)  # True if all tokens in sequence are correct
+        exact_match_acc = exact_match_correct.float().mean(dim=0)  # Average over batch
+        
+    else:  # Original case: (batch_size, model_count, output_dim)
+        n, m, o = pred.shape
+        loss = loss_func(pred.view(n * m, o), labels.repeat_interleave(m)).view(n, m).mean(dim=0)
+        token_acc = (pred.view(n * m, o).argmax(dim=1) == labels.repeat_interleave(m)).view(n, m).float().mean(dim=0)
+        # For non-transformer models, exact match = token accuracy (single prediction per example)
+        exact_match_acc = token_acc
+    
+    return loss, token_acc, exact_match_acc
+
 
 def make_permutation_invariant(m1, m2):
     # shape (1, model_count, out_d, in_d)

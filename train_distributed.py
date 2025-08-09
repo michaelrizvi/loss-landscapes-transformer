@@ -552,9 +552,10 @@ if __name__ == "__main__":
                 train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, 
                 batch_size=cur_batch_size, es_u=es_u, test_all_data=test_all_data, test_all_labels=test_all_labels)
             with torch.no_grad():
-                train_loss, train_acc = calculate_loss_acc(train_data, train_labels, model_result.forward_normalize, loss_func, batch_size=cur_batch_size)
+                train_loss, train_acc, train_exact_acc = calculate_loss_acc_with_exact_match(train_data, train_labels, model_result.forward_normalize, loss_func, batch_size=cur_batch_size)
                 if train_acc.max() > prior_max:
-                    print("max train acc:", train_acc.max().detach().cpu().item())
+                    print("max train token acc:", train_acc.max().detach().cpu().item())
+                    print("max train exact acc:", train_exact_acc.max().detach().cpu().item())
                     prior_max = train_acc.max()
                 print("tested_model_count", tested_model_count)
             # filtering models based on loss threshold
@@ -632,10 +633,12 @@ if __name__ == "__main__":
             print(f"model linf norm: {model_linf_norm}")
 
             with torch.no_grad():
-                loss, acc = calculate_loss_acc(train_data.cpu(), train_labels.cpu(), new_models, loss_func, batch_size=1)
-                test_loss, test_acc = calculate_loss_acc(test_all_data.cpu(), test_all_labels.cpu(), new_models, loss_func, batch_size=1)
-                print(f"verify that train acc is 100%: {acc.mean().item()}")
-                print(f"test acc: {test_acc.mean().item(): 0.3f} ({test_acc.max().item(): 0.3f} , {test_acc.min().item(): 0.3f} )")
+                loss, token_acc, exact_acc = calculate_loss_acc_with_exact_match(train_data.cpu(), train_labels.cpu(), new_models, loss_func, batch_size=1)
+                test_loss, test_token_acc, test_exact_acc = calculate_loss_acc_with_exact_match(test_all_data.cpu(), test_all_labels.cpu(), new_models, loss_func, batch_size=1)
+                print(f"verify that train token acc is 100%: {token_acc.mean().item()}")
+                print(f"train exact match acc: {exact_acc.mean().item(): 0.3f} ({exact_acc.max().item(): 0.3f} , {exact_acc.min().item(): 0.3f} )")
+                print(f"test token acc: {test_token_acc.mean().item(): 0.3f} ({test_token_acc.max().item(): 0.3f} , {test_token_acc.min().item(): 0.3f} )")
+                print(f"test exact match acc: {test_exact_acc.mean().item(): 0.3f} ({test_exact_acc.max().item(): 0.3f} , {test_exact_acc.min().item(): 0.3f} )")
 
             # saving the models
             os.makedirs(os.path.join(config['output.folder'], "models"), exist_ok=True)
@@ -661,16 +664,20 @@ if __name__ == "__main__":
                     )
                     
                     # Test on longer sequences
-                    long_test_loss, long_test_acc = calculate_loss_acc(
+                    long_test_loss, long_test_token_acc, long_test_exact_acc = calculate_loss_acc_with_exact_match(
                         long_data.cpu(), long_labels.cpu(), new_models, loss_func, batch_size=1
                     )
                     
-                    print(f"Length generalization (10-20) acc: {long_test_acc.mean().item(): 0.3f} ({long_test_acc.max().item(): 0.3f} , {long_test_acc.min().item(): 0.3f} )")
+                    print(f"Length generalization (10-20) token acc: {long_test_token_acc.mean().item(): 0.3f} ({long_test_token_acc.max().item(): 0.3f} , {long_test_token_acc.min().item(): 0.3f} )")
+                    print(f"Length generalization (10-20) exact acc: {long_test_exact_acc.mean().item(): 0.3f} ({long_test_exact_acc.max().item(): 0.3f} , {long_test_exact_acc.min().item(): 0.3f} )")
                     
                     # Store the length generalization results in config for saving
-                    saveconfig['length_gen_acc_mean'] = long_test_acc.mean().item()
-                    saveconfig['length_gen_acc_max'] = long_test_acc.max().item()
-                    saveconfig['length_gen_acc_min'] = long_test_acc.min().item()
+                    saveconfig['length_gen_token_acc_mean'] = long_test_token_acc.mean().item()
+                    saveconfig['length_gen_token_acc_max'] = long_test_token_acc.max().item()
+                    saveconfig['length_gen_token_acc_min'] = long_test_token_acc.min().item()
+                    saveconfig['length_gen_exact_acc_mean'] = long_test_exact_acc.mean().item()
+                    saveconfig['length_gen_exact_acc_max'] = long_test_exact_acc.max().item()
+                    saveconfig['length_gen_exact_acc_min'] = long_test_exact_acc.min().item()
 
             # save the model
             torch.save({"kwargs": kwargs,
