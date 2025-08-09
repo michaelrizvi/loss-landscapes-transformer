@@ -1,0 +1,31 @@
+# Simple config to find 5 perfect models for length generalization testing
+dataset:
+  name: counting
+
+model:
+  arch: transformer
+  model_count_times_batch_size: 500  # 10 models * 50 batch size (small & fast)
+  init: regular
+
+model.transformer:
+  vocab_size: 110
+  d_model: 32
+  n_layers: 2  
+  n_heads: 4
+  d_ff: 64
+  max_len: 32
+  dropout: 0.1
+
+optimizer:
+  name: PatternSearchFast
+  epochs: 100
+  es_acc: 0.99  # High threshold to ensure perfect models
+  
+distributed:
+  loss_thres: "-999,999"        # Accept ANY loss - just need perfect accuracy!
+  num_samples: "100"            # Single dataset size
+  target_model_count_subrun: 5  # Collect 5 models per run
+
+output:
+  target_model_count: 5         # Stop after finding 5 total models
+  folder: "counting_perfect_models"
