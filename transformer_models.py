@@ -274,42 +274,65 @@ class TransformerModels(nn.Module):
     @torch.no_grad()
     def pattern_search(self, x, y, loss_func):
         """
-        Pattern search optimization similar to LeNetModels.
+        Pattern search optimization with improved parameter handling for transformers.
         Tests different parameter perturbations across multiple models.
         """
         if self.basis_list is None:
             self.basis_list = []
-            for para in self.parameters():
-                para_flatten = para.data.view(self.model_count, -1)
+            for name, para in self.named_parameters():
+                original_shape = para.shape
+                # Handle different parameter shapes correctly
+                if len(original_shape) >= 2:
+                    # 2D+ parameters: reshape to (model_count, -1)
+                    para_flatten = para.data.view(self.model_count, -1)
+                elif len(original_shape) == 1 and original_shape[0] % self.model_count == 0:
+                    # 1D parameters that are model-specific: reshape to (model_count, -1)
+                    para_flatten = para.data.view(self.model_count, -1)
+                else:
+                    # Skip parameters that don't fit the multi-model structure
+                    continue
+                    
                 for p in range(para_flatten.shape[1]):
-                    self.basis_list.append((para_flatten, p, "+"))
-                    self.basis_list.append((para_flatten, p, "-"))
+                    self.basis_list.append((para, para_flatten, p, "+", name))
+                    self.basis_list.append((para, para_flatten, p, "-", name))
         
         random.shuffle(self.basis_list)
         self.curr_idx = 0
+        max_attempts = min(len(self.basis_list), self.model_count - 1)
 
         while True:
             # Replicate the first model across all model copies
             for para in self.parameters():
                 original_shape = para.shape
-                para_reshaped = para.data.view(self.model_count, -1, *original_shape[2:])
-                para_reshaped[1:] = para_reshaped[0:1]
+                if len(original_shape) >= 2:
+                    # 2D+ parameters: reshape correctly
+                    para_reshaped = para.data.view(self.model_count, -1)
+                    para_reshaped[1:] = para_reshaped[0:1]
+                elif len(original_shape) == 1 and original_shape[0] % self.model_count == 0:
+                    # 1D parameters that are model-specific
+                    para_reshaped = para.data.view(self.model_count, -1)
+                    para_reshaped[1:] = para_reshaped[0:1]
 
             # Modify each model at one parameter location
-            for i in range(1, self.model_count):
-                para, p_i, op = self.basis_list[self.curr_idx]
-                if op == "+":
-                    para[i, p_i] += self.radius
-                else:
-                    para[i, p_i] -= self.radius
-                self.curr_idx += 1
-                
+            improvements_found = 0
+            for i in range(1, min(self.model_count, max_attempts + 1)):
                 if self.curr_idx >= len(self.basis_list):
-                    print("Pattern search: completed parameter sweep")
-                    random.shuffle(self.basis_list)
-                    self.radius /= 2
-                    self.curr_idx = 0
                     break
+                    
+                original_para, para_flatten, p_i, op, param_name = self.basis_list[self.curr_idx]
+                
+                # Apply perturbation with adaptive radius based on parameter type
+                adaptive_radius = self.radius
+                if 'ln' in param_name or 'bias' in param_name:
+                    adaptive_radius *= 0.1  # Smaller perturbations for layer norm and bias
+                elif 'emb' in param_name:
+                    adaptive_radius *= 0.5  # Medium perturbations for embeddings
+                
+                if op == "+":
+                    para_flatten[i, p_i] += adaptive_radius
+                else:
+                    para_flatten[i, p_i] -= adaptive_radius
+                self.curr_idx += 1
 
             # Forward pass and select best model
             pred = self.forward_normalize(x)  # (batch_size, model_count, seq_len, vocab_size)
@@ -322,20 +345,46 @@ class TransformerModels(nn.Module):
             ).view(n, m, t).mean(dim=(0, 2))  # Average over batch and sequence
             
             best_idx = loss.min(dim=0).indices
+            best_loss = loss[best_idx]
 
-            # Copy best model to position 0
-            for para in self.parameters():
-                original_shape = para.shape
-                para_reshaped = para.data.view(self.model_count, -1, *original_shape[2:])
-                para_reshaped[:] = para_reshaped[best_idx:best_idx+1]
-            
-            if best_idx != 0:
+            # Copy best model to position 0, but only if it's better
+            current_loss = loss[0]
+            if best_loss < current_loss:
+                for para in self.parameters():
+                    original_shape = para.shape
+                    if len(original_shape) >= 2:
+                        para_reshaped = para.data.view(self.model_count, -1)
+                        para_reshaped[0] = para_reshaped[best_idx]
+                    elif len(original_shape) == 1 and original_shape[0] % self.model_count == 0:
+                        para_reshaped = para.data.view(self.model_count, -1)
+                        para_reshaped[0] = para_reshaped[best_idx]
+                improvements_found += 1
+                
+            # Check termination conditions
+            if self.curr_idx >= len(self.basis_list):
+                if improvements_found == 0:
+                    # No improvements found in full sweep, reduce radius
+                    self.radius *= 0.5
+                    print(f"Pattern search: radius reduced to {self.radius:.6f}")
+                    if self.radius < 1e-8:
+                        print("Pattern search: radius too small, stopping")
+                        break
+                else:
+                    # Some improvements found, continue with current radius
+                    print(f"Pattern search: found {improvements_found} improvements")
+                
+                random.shuffle(self.basis_list)
+                self.curr_idx = 0
+                max_attempts = min(len(self.basis_list), self.model_count - 1)
+                
+            # Stop if we made a significant improvement
+            if best_idx != 0 and improvements_found > 0:
                 break
 
     @torch.no_grad() 
     def greedy_random(self, x, y, loss_func):
         """
-        Greedy random search optimization similar to LeNetModels.
+        Greedy random search optimization with improved parameter handling.
         """
         for _ in range(30):
             iter_max = 100
@@ -343,9 +392,16 @@ class TransformerModels(nn.Module):
                 # Add noise to all models except the first one
                 for para in self.parameters():
                     original_shape = para.shape
-                    para_reshaped = para.data.view(self.model_count, -1, *original_shape[2:])
-                    para_reshaped[1:] = para_reshaped[0:1]
-                    para_reshaped[1:] += torch.randn_like(para_reshaped[1:]) * self.radius
+                    if len(original_shape) >= 2:
+                        # 2D+ parameters: reshape correctly
+                        para_reshaped = para.data.view(self.model_count, -1)
+                        para_reshaped[1:] = para_reshaped[0:1]
+                        para_reshaped[1:] += torch.randn_like(para_reshaped[1:]) * self.radius
+                    elif len(original_shape) == 1 and original_shape[0] % self.model_count == 0:
+                        # 1D parameters that are model-specific
+                        para_reshaped = para.data.view(self.model_count, -1)
+                        para_reshaped[1:] = para_reshaped[0:1]
+                        para_reshaped[1:] += torch.randn_like(para_reshaped[1:]) * self.radius
 
                 # Forward pass and select best model
                 pred = self.forward_normalize(x)
@@ -361,8 +417,12 @@ class TransformerModels(nn.Module):
                 # Copy best model to all positions
                 for para in self.parameters():
                     original_shape = para.shape
-                    para_reshaped = para.data.view(self.model_count, -1, *original_shape[2:])
-                    para_reshaped[:] = para_reshaped[best_idx:best_idx + 1]
+                    if len(original_shape) >= 2:
+                        para_reshaped = para.data.view(self.model_count, -1)
+                        para_reshaped[:] = para_reshaped[best_idx:best_idx + 1]
+                    elif len(original_shape) == 1 and original_shape[0] % self.model_count == 0:
+                        para_reshaped = para.data.view(self.model_count, -1)
+                        para_reshaped[:] = para_reshaped[best_idx:best_idx + 1]
                 
                 if best_idx != 0:
                     return
@@ -389,20 +449,29 @@ class TransformerModels(nn.Module):
 
     @torch.no_grad()
     def get_weights_by_idx(self, idx):
-        """Extract weights for specific model indices."""
+        """Extract weights for specific model indices with improved parameter handling."""
         weight_dict = {}
         for name, para in self.state_dict().items():
             original_shape = para.shape
-            if 'token_emb' in name or 'pos_emb' in name:
-                # These are shared, just slice the expanded dimension
-                para_reshaped = para.reshape(self.model_count, -1, *original_shape[2:])
+            
+            # Handle different parameter shapes correctly
+            if len(original_shape) >= 2:
+                # 2D+ parameters: reshape to (model_count, -1) then extract
+                para_reshaped = para.reshape(self.model_count, -1)
                 para_selected = para_reshaped[idx]
-                para_selected = para_selected.reshape(-1, *original_shape[1:])
+                # Reconstruct original shape with new model count
+                new_shape = (len(idx),) + original_shape[1:]
+                para_selected = para_selected.reshape(new_shape)
+            elif len(original_shape) == 1 and original_shape[0] % self.model_count == 0:
+                # 1D parameters that are model-specific
+                param_per_model = original_shape[0] // self.model_count
+                para_reshaped = para.reshape(self.model_count, param_per_model)
+                para_selected = para_reshaped[idx]
+                para_selected = para_selected.reshape(-1)
             else:
-                # These are per-model parameters
-                para_reshaped = para.reshape(self.model_count, -1, *original_shape[2:])
-                para_selected = para_reshaped[idx] 
-                para_selected = para_selected.reshape(-1, *original_shape[1:])
+                # Parameters that don't follow multi-model structure, keep as is
+                para_selected = para
+                
             weight_dict[name] = para_selected.clone().detach().cpu()
         return weight_dict
 
