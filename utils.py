@@ -26,14 +26,15 @@ def calculate_loss_acc(data, labels, model, loss_func, batch_size=None):
         acc = (pred.view(n * m, o).argmax(dim=1) == labels.repeat_interleave(m)).view(n, m).float().mean(dim=0)
     return loss, acc
 
-def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_size=None):
+def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_size=None, sep_token=102, pad_token=103):
     """
     Calculate loss, token-level accuracy, and exact match accuracy.
+    For transformers, exact match only considers the counting output part after the separator.
     
     Returns:
         loss: Loss per model
         token_acc: Token-level accuracy per model  
-        exact_match_acc: Exact match (sequence-level) accuracy per model
+        exact_match_acc: Exact match accuracy per model (only for counting output)
     """
     if batch_size is None:
         pred = model(data)  # pred.shape = (# of examples, # model counts , output_dim)
@@ -54,8 +55,38 @@ def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_si
         token_correct = (pred.view(n * m * t, o).argmax(dim=1) == labels.repeat(1, m).view(-1)).view(n, m, t)
         token_acc = token_correct.float().mean(dim=(0, 2))  # Average over batch and sequence
         
-        # Exact match accuracy: all tokens in sequence must be correct
-        exact_match_correct = token_correct.all(dim=2)  # True if all tokens in sequence are correct
+        # Exact match accuracy: only check counting output after separator
+        exact_match_correct_list = []
+        
+        for batch_idx in range(n):
+            # Find separator position in the input sequence for this batch item
+            input_seq = data[batch_idx]  # Input sequence for this batch item
+            sep_positions = (input_seq == sep_token).nonzero(as_tuple=True)[0]
+            
+            if len(sep_positions) > 0:
+                sep_pos = sep_positions[0].item()  # Position of separator in input
+                # The counting output starts at sep_pos + 1 in the target sequence
+                counting_start = sep_pos + 1
+                
+                # Find where counting ends (before padding)
+                target_seq = labels[batch_idx]
+                counting_end = t  # Default to end of sequence
+                pad_positions = (target_seq == pad_token).nonzero(as_tuple=True)[0]
+                if len(pad_positions) > 0:
+                    counting_end = pad_positions[0].item()
+                
+                # Check if counting part is correct for each model
+                if counting_start < counting_end:
+                    counting_correct = token_correct[batch_idx, :, counting_start:counting_end].all(dim=1)
+                else:
+                    counting_correct = torch.ones(m, dtype=torch.bool, device=token_correct.device)  # Empty counting = correct
+            else:
+                # No separator found, consider the entire sequence (fallback)
+                counting_correct = token_correct[batch_idx, :, :].all(dim=1)
+            
+            exact_match_correct_list.append(counting_correct)
+        
+        exact_match_correct = torch.stack(exact_match_correct_list, dim=0)  # (n, m)
         exact_match_acc = exact_match_correct.float().mean(dim=0)  # Average over batch
         
     else:  # Original case: (batch_size, model_count, output_dim)
