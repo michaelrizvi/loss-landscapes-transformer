@@ -319,7 +319,7 @@ class TransformerModels(nn.Module):
             # Compute loss for each model
             loss = loss_func(
                 pred.reshape(n * m * t, o), 
-                y.repeat_interleave(m * t)
+                y.repeat(1, m).view(-1)
             ).view(n, m, t).mean(dim=(0, 2))  # Average over batch and sequence
             
             best_idx = loss.min(dim=0).indices
