@@ -386,13 +386,13 @@ def train_ps_fast(train_data, train_labels, test_data, test_labels, model, loss_
     for epoch in range(epochs):
         model.pattern_search(train_data, train_labels, loss_func)
         if epoch % (epochs // 100) == 0:
-            train_loss, train_acc = calculate_loss_acc(train_data, train_labels, model.forward_normalize, loss_func)
-            test_loss, test_acc = calculate_loss_acc(test_data, test_labels, model.forward_normalize, loss_func)
+            train_loss, train_token_acc, train_exact_acc = calculate_loss_acc_with_exact_match(train_data, train_labels, model.forward_normalize, loss_func)
+            test_loss, test_token_acc, test_exact_acc = calculate_loss_acc_with_exact_match(test_data, test_labels, model.forward_normalize, loss_func)
             print(
-                f"epoch {epoch} - train_loss: {train_loss.mean().cpu().detach().item(): 0.4f}, train_acc: {train_acc.mean().cpu().detach().item(): 0.2f}")
+                f"epoch {epoch} - train_loss: {train_loss.mean().cpu().detach().item(): 0.4f}, train_token_acc: {train_token_acc.mean().cpu().detach().item(): 0.3f}, train_exact_acc: {train_exact_acc.mean().cpu().detach().item(): 0.3f}")
             print(
-                f"epoch {epoch} - test acc: {test_acc.mean().item(): 0.2f}, test loss: {test_loss.mean().item(): 0.2f}")
-            if train_acc.mean() >= es_acc:
+                f"epoch {epoch} - test_token_acc: {test_token_acc.mean().item(): 0.3f}, test_exact_acc: {test_exact_acc.mean().item(): 0.3f}, test_loss: {test_loss.mean().item(): 0.2f}")
+            if train_token_acc.mean() >= es_acc:
                 break
     return model.get_model_subsets([0]).to(train_data.device)
 
