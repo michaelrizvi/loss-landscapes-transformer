@@ -58,7 +58,7 @@ class TransformerModels(nn.Module):
     Uses parameter replication approach similar to LeNetModels.
     """
     
-    def __init__(self, vocab_size, d_model, n_layers, n_heads, d_ff, max_len, model_count, device='cuda'):
+    def __init__(self, vocab_size, d_model, n_layers, n_heads, d_ff, max_len, dropout, model_count, device='cuda'):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -66,8 +66,12 @@ class TransformerModels(nn.Module):
         self.n_heads = n_heads
         self.d_ff = d_ff
         self.max_len = max_len
+        self.dropout = dropout
         self.model_count = model_count
         self.device = device
+        
+        # Dropout layer
+        self.dropout_layer = nn.Dropout(dropout)
         
         # Create parameters for model_count independent transformers
         # Token embeddings - replicated for each model
@@ -235,6 +239,7 @@ class TransformerModels(nn.Module):
                 
                 # Attention
                 attn_out = self._attention_forward(normed, layer_idx, model_idx)
+                attn_out = self.dropout_layer(attn_out)  # Apply dropout
                 hidden = hidden + attn_out  # Residual connection
                 
                 # Layer norm 2
@@ -251,6 +256,7 @@ class TransformerModels(nn.Module):
                 ff2_weight = self.transformer_params[f'ff2_{layer_idx}_weight'][model_idx]
                 ff2_bias = self.transformer_params[f'ff2_{layer_idx}_bias'][model_idx]
                 ff_out = F.linear(ff_out, ff2_weight, ff2_bias)
+                ff_out = self.dropout_layer(ff_out)  # Apply dropout
                 
                 hidden = hidden + ff_out  # Residual connection
             
