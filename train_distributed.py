@@ -25,6 +25,23 @@ Section("dataset.kink", "Dataset parameters for kink").enable_if(
 Section("dataset.mnistcifar", "Dataset parameters for mnist/cifar").params(
     num_classes=Param(int)
 )
+Section("dataset.counting", "Dataset parameters for counting sequences").enable_if(
+    lambda cfg: cfg['dataset.name'] == 'counting'
+).params(
+    min_range_size=Param(int, default=1),
+    max_range_size=Param(int, default=10),
+    vocab_size=Param(int, default=50),
+    sep_token=Param(int, default=102),
+    pad_token=Param(int, default=103),
+    max_len=Param(int, default=32)
+)
+Section("dataset.counting.length_generalization", "Length generalization test parameters").enable_if(
+    lambda cfg: cfg['dataset.name'] == 'counting'
+).params(
+    min_range_size=Param(int, default=10),
+    max_range_size=Param(int, default=20),
+    samples=Param(int, default=200)
+)
 Section("model", "Model architecture parameters").params(
     arch=Param(str, OneOf(("mlp", "lenet", "transformer")), default="mlp"),
     model_count_times_batch_size=Param(int, default=20000*16),
@@ -55,7 +72,7 @@ Section("optimizer").params(
     lr=Param(float, desc='learning rate'),
     momentum=Param(float, desc='momentum', default=0),
     epochs=Param(int, desc='number of epochs to optimize  for'),
-    es_acc=Param(float, desc='stop the training when average training acc reaches this level'),
+    es_acc=Param(float, desc='stop the training when average training acc reaches this level', default=0.99),
     batch_size=Param(int, desc='number of epochs ot optimize for', default=3),
     scheduler=Param(int, desc='whether to use a scheduler', default=False),
     poison_factor=Param(float, desc='level of poisoning applied'),
@@ -83,7 +100,15 @@ Section("output", "arguments associated with output").params(
 @param('mnistcifar.num_classes')
 @param('kink.noise')
 @param('kink.margin')
-def get_dataset(name, num_samples, seed, num_classes=None, noise=None, margin=0.25):
+@param('counting.min_range_size')
+@param('counting.max_range_size')
+@param('counting.vocab_size')
+@param('counting.sep_token')
+@param('counting.pad_token')
+@param('counting.max_len')
+def get_dataset(name, num_samples, seed, num_classes=None, noise=None, margin=0.25,
+                min_range_size=1, max_range_size=10, vocab_size=50, 
+                sep_token=102, pad_token=103, max_len=32):
     if name =="mnist":
         name = MNIST(batch_size=num_samples, threads=1, aug='none', train_count=num_samples, num_classes=num_classes, seed=seed)
         train_data, train_labels = next(iter(name.train))
@@ -133,9 +158,19 @@ def get_dataset(name, num_samples, seed, num_classes=None, noise=None, margin=0.
     elif name == "counting":
         # Counting sequences for transformer training
         train_dataset = CountingSequences(train=True, samples=num_samples, seed=seed, 
-                                        min_range_size=1, max_range_size=10, vocab_size=50, max_len=32)
+                                        min_range_size=min_range_size, 
+                                        max_range_size=max_range_size, 
+                                        vocab_size=vocab_size,
+                                        sep_token=sep_token,
+                                        pad_token=pad_token,
+                                        max_len=max_len)
         test_dataset = CountingSequences(train=False, samples=num_samples, seed=seed,
-                                       min_range_size=1, max_range_size=10, vocab_size=50, max_len=32) 
+                                       min_range_size=min_range_size, 
+                                       max_range_size=max_range_size, 
+                                       vocab_size=vocab_size,
+                                       sep_token=sep_token,
+                                       pad_token=pad_token,
+                                       max_len=max_len) 
         
         # Convert to tensors and move to GPU
         train_data, train_labels = [], []
@@ -231,7 +266,7 @@ def get_optimizer_and_scheduler(name, model, scheduler=False, lr=None, momentum=
 @param('es_acc')
 @param('print_intermediate_test_acc')
 def train_sgd(
-    train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, batch_size, epochs, es_u, es_acc=1, print_intermediate_test_acc=0):
+    train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, batch_size, epochs, es_u, es_acc=1, print_intermediate_test_acc=0, model_id=None):
 
     for epoch in range(epochs):
         idx_list = torch.randperm(len(train_data))
@@ -281,7 +316,7 @@ def train_sgd(
 @param('poison_factor')
 def train_sgd_poison(
     train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, batch_size, epochs, es_u, es_acc=1, poison_factor=None,
-    test_all_data=None, test_all_labels=None):
+    test_all_data=None, test_all_labels=None, model_id=None):
     test_all_data, test_all_labels = test_all_data.cuda(), test_all_labels.cuda()
     poison_test_labels = torch.tensor([1,0], device=test_all_labels.device)[test_all_labels]
     repeats = 10
@@ -322,7 +357,7 @@ def train_sgd_poison(
 @param('epochs')
 @param('es_acc')
 @param('es_u')
-def train_gd(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, epochs, es_u, es_acc=2):
+def train_gd(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, epochs, es_u, es_acc=2, model_id=None):
     for epoch in range(epochs):
         train_loss, train_acc = calculate_loss_acc(train_data, train_labels, model, loss_func)
         if es_u != float('inf'):
@@ -348,7 +383,7 @@ def train_gd(train_data, train_labels, test_data, test_labels, model, loss_func,
 @param('epochs')
 @param('es_acc')
 @torch.no_grad()
-def train_nm(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, epochs, es_acc=2):
+def train_nm(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, epochs, es_acc=2, model_id=None):
     for epoch in range(epochs):
         optimizer.step(lambda: calculate_loss_acc(train_data, train_labels, model, loss_func)[0][0])
         if epoch % (epochs // 100 + 1) == 0:
@@ -366,7 +401,7 @@ def train_nm(train_data, train_labels, test_data, test_labels, model, loss_func,
 @param('epochs')
 @param('es_acc')
 @torch.no_grad()
-def train_ps(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, epochs, es_acc=2):
+def train_ps(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, epochs, es_acc=2, model_id=None):
     for epoch in range(epochs):
         optimizer.step(lambda: calculate_loss_acc(train_data, train_labels, model.forward_normalize, loss_func)[0][0])
         if epoch % (epochs // 100) == 0:
@@ -383,7 +418,7 @@ def train_ps(train_data, train_labels, test_data, test_labels, model, loss_func,
 @param('epochs')
 @param('es_acc')
 @torch.no_grad()
-def train_ps_fast(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, epochs, es_acc=2):
+def train_ps_fast(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, epochs, es_acc=2, model_id=None):
     for epoch in range(epochs):
         model.pattern_search(train_data, train_labels, loss_func)
         if epoch % (epochs // 100) == 0:
@@ -393,8 +428,10 @@ def train_ps_fast(train_data, train_labels, test_data, test_labels, model, loss_
                 f"epoch {epoch} - train_loss: {train_loss.mean().cpu().detach().item(): 0.4f}, train_acc: {train_acc.mean().cpu().detach().item(): 0.2f}")
             print(
                 f"epoch {epoch} - test acc: {test_acc.mean().item(): 0.2f}, test loss: {test_loss.mean().item(): 0.2f}")
+            
             if train_acc.mean() >= es_acc:
                 break
+    
     return model.get_model_subsets([0]).to(train_data.device)
 
 
@@ -402,7 +439,7 @@ def train_ps_fast(train_data, train_labels, test_data, test_labels, model, loss_
 @param('epochs')
 @param('es_acc')
 @torch.no_grad()
-def train_greedy_random(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, epochs, es_acc=2):
+def train_greedy_random(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, epochs, es_acc=2, model_id=None):
     for epoch in range(epochs):
         model.greedy_random(train_data, train_labels, loss_func)
         if epoch % (epochs // 300) == 0:
@@ -419,21 +456,21 @@ def train_greedy_random(train_data, train_labels, test_data, test_labels, model,
 
 @section('optimizer')
 @param('name')
-def train(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, name, batch_size=None, es_u=None, test_all_data=None, test_all_labels=None):
+def train(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, name, batch_size=None, es_u=None, test_all_data=None, test_all_labels=None, model_id=None):
     if name in ["SGD",  "RMSProp", "Adam"]:
-        train_sgd(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, batch_size=batch_size, es_u=es_u)
+        train_sgd(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, batch_size=batch_size, es_u=es_u, model_id=model_id)
     elif name in ["SGDPoison"]:
-        train_sgd_poison(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, batch_size=batch_size, es_u=es_u, test_all_data=test_all_data, test_all_labels=test_all_labels)
+        train_sgd_poison(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, batch_size=batch_size, es_u=es_u, test_all_data=test_all_data, test_all_labels=test_all_labels, model_id=model_id)
     elif name == "GD":
-        train_gd(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, es_u=es_u)
+        train_gd(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, es_u=es_u, model_id=model_id)
     elif name == "NelderMead":
-        train_nm(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer)
+        train_nm(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, model_id=model_id)
     elif name == "PatternSearch":
-        train_ps(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer)
+        train_ps(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, model_id=model_id)
     elif name == "PatternSearchFast":
-        model = train_ps_fast(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer)
+        model = train_ps_fast(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, model_id=model_id)
     elif name == "GreedyRandom":
-        model = train_greedy_random(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer)
+        model = train_greedy_random(train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, model_id=model_id)
     else:
         pass
     return model
@@ -528,7 +565,7 @@ if __name__ == "__main__":
 
         perfect_model_count = 0
         perfect_model_weights = []
-        loss_func = nn.CrossEntropyLoss(reduction='none')
+        loss_func = get_loss_function(config['model.arch'])
         target_model_count_subrun = config['distributed.target_model_count_subrun']
         start_time = time.time()
         tested_model_count = 0
@@ -549,9 +586,11 @@ if __name__ == "__main__":
             elif config['model.init'] == "regular":
                 model.reset_parameters()
             optimizer, scheduler = get_optimizer_and_scheduler(model=model)
+            
+            ##### THIS IS WHERE THE MODEL TRAINS ####
             model_result = train(
                 train_data, train_labels, test_data, test_labels, model, loss_func, optimizer, scheduler, 
-                batch_size=cur_batch_size, es_u=es_u, test_all_data=test_all_data, test_all_labels=test_all_labels)
+                batch_size=cur_batch_size, es_u=es_u, test_all_data=test_all_data, test_all_labels=test_all_labels, model_id=model_id)
             with torch.no_grad():
                 train_loss, train_acc, train_exact_acc = calculate_loss_acc_with_exact_match(train_data, train_labels, model_result.forward_normalize, loss_func, batch_size=cur_batch_size)
                 if train_acc.max() > prior_max:
@@ -559,8 +598,8 @@ if __name__ == "__main__":
                     print("max train exact acc:", train_exact_acc.max().detach().cpu().item())
                     prior_max = train_acc.max()
                 print("tested_model_count", tested_model_count)
-            # filtering models based on loss threshold
-            perfect_model_idxs = ((es_l< train_loss) & (train_loss <= es_u) & (train_acc == 1.0))
+            # filtering models based on loss threshold and accuracy threshold
+            perfect_model_idxs = ((es_l< train_loss) & (train_loss <= es_u) & (train_acc >= config['optimizer.es_acc']))
 
             perfect_model_count_cur = perfect_model_idxs.sum().detach().cpu().item()
             perfect_model_count += perfect_model_count_cur
@@ -657,20 +696,24 @@ if __name__ == "__main__":
                 from datasets import create_length_generalization_data
                 
                 with torch.no_grad():
-                    # Create longer sequences (length 10-20) for testing generalization
+                    # Create longer sequences for testing generalization
                     long_data, long_labels = create_length_generalization_data(
-                        min_range_size=10, max_range_size=20, samples=200, 
+                        min_range_size=config['dataset.counting.length_generalization.min_range_size'], 
+                        max_range_size=config['dataset.counting.length_generalization.max_range_size'], 
+                        samples=config['dataset.counting.length_generalization.samples'], 
                         vocab_size=config['model.transformer.vocab_size'],
+                        sep_token=config['dataset.counting.sep_token'],
+                        pad_token=config['dataset.counting.pad_token'],
                         max_len=config['model.transformer.max_len']
                     )
-                    
+                     
                     # Test on longer sequences
                     long_test_loss, long_test_token_acc, long_test_exact_acc = calculate_loss_acc_with_exact_match(
                         long_data.cpu(), long_labels.cpu(), new_models, loss_func, batch_size=1
                     )
                     
-                    print(f"Length generalization (10-20) token acc: {long_test_token_acc.mean().item(): 0.3f} ({long_test_token_acc.max().item(): 0.3f} , {long_test_token_acc.min().item(): 0.3f} )")
-                    print(f"Length generalization (10-20) exact acc: {long_test_exact_acc.mean().item(): 0.3f} ({long_test_exact_acc.max().item(): 0.3f} , {long_test_exact_acc.min().item(): 0.3f} )")
+                    print(f"Length generalization ({config['dataset.counting.length_generalization.min_range_size']}-{config['dataset.counting.length_generalization.max_range_size']}) token acc: {long_test_token_acc.mean().item(): 0.3f} ({long_test_token_acc.max().item(): 0.3f} , {long_test_token_acc.min().item(): 0.3f} )")
+                    print(f"Length generalization ({config['dataset.counting.length_generalization.min_range_size']}-{config['dataset.counting.length_generalization.max_range_size']}) exact acc: {long_test_exact_acc.mean().item(): 0.3f} ({long_test_exact_acc.max().item(): 0.3f} , {long_test_exact_acc.min().item(): 0.3f} )")
                     
                     # Store the length generalization results in config for saving
                     saveconfig['length_gen_token_acc_mean'] = long_test_token_acc.mean().item()
@@ -679,6 +722,9 @@ if __name__ == "__main__":
                     saveconfig['length_gen_exact_acc_mean'] = long_test_exact_acc.mean().item()
                     saveconfig['length_gen_exact_acc_max'] = long_test_exact_acc.max().item()
                     saveconfig['length_gen_exact_acc_min'] = long_test_exact_acc.min().item()
+                    saveconfig['length_gen_min_range_size'] = config['dataset.counting.length_generalization.min_range_size']
+                    saveconfig['length_gen_max_range_size'] = config['dataset.counting.length_generalization.max_range_size']
+                    saveconfig['length_gen_samples'] = config['dataset.counting.length_generalization.samples']
 
             # save the model
             torch.save({"kwargs": kwargs,

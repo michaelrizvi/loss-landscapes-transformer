@@ -486,8 +486,8 @@ class CountingSequences(Dataset):
     The model is trained to predict the next token given the sequence so far.
     """
     
-    def __init__(self, train=True, samples=1000, seed=42, min_range_size=1, max_range_size=10, 
-                 vocab_size=32, sep_token=102, pad_token=103, max_len=32):
+    def __init__(self, train=True, samples=5000, seed=42, min_range_size=1, max_range_size=10, 
+                 vocab_size=110, sep_token=102, pad_token=103, max_len=32):
         """
         Args:
             train: Whether this is training or test data

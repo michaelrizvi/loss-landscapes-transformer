@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
+from utils import precompute_freqs_cis, apply_rotary_emb, compute_freqs_cis_dynamic
 
 
 class CausalSelfAttention(nn.Module):
@@ -31,13 +32,62 @@ class CausalSelfAttention(nn.Module):
         return self.out(attn)
 
 
+class CausalSelfAttentionRotary(nn.Module):
+    """Single model causal self-attention with rotary positional encoding."""
+    
+    def __init__(self, d_model, n_heads, max_seq_len, dropout=0.1, theta=10000.0, device='cuda'):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_k = d_model // n_heads
+        self.n_heads = n_heads
+        self.max_seq_len = max_seq_len
+        
+        # Ensure head dimension is even for rotary encoding
+        assert self.d_k % 2 == 0, f"Head dimension must be even for rotary encoding, got {self.d_k}"
+        
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.out = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Precompute rotary frequencies
+        self.register_buffer(
+            'freqs_cis', 
+            precompute_freqs_cis(self.d_k, max_seq_len, theta, device)
+        )
+
+    def forward(self, x):
+        B, T, C = x.size()
+        qkv = self.qkv(x).reshape(B, T, self.n_heads, 3 * self.d_k).transpose(1, 2)
+        q, k, v = qkv.chunk(3, dim=-1)  # Each: (B, n_heads, T, d_k)
+
+        # Apply rotary positional encoding to queries and keys
+        freqs = self.freqs_cis.to(x.device)
+        q, k = apply_rotary_emb(q, k, freqs)
+
+        # Compute attention scores
+        attn_scores = (q @ k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)
+        attn_scores = attn_scores.masked_fill(causal_mask == 0, float('-inf'))
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn = self.dropout(attn_weights) @ v
+
+        attn = attn.transpose(1, 2).contiguous().reshape(B, T, C)
+        return self.out(attn)
+
+
 class TransformerBlock(nn.Module):
     """Single model transformer block - we'll replicate this across models."""
     
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+    def __init__(self, d_model, n_heads, d_ff, max_seq_len=None, dropout=0.1, use_rotary=True, theta=10000.0, device='cuda'):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
+        
+        if use_rotary:
+            assert max_seq_len is not None, "max_seq_len required for rotary attention"
+            self.attn = CausalSelfAttentionRotary(d_model, n_heads, max_seq_len, dropout, theta, device)
+        else:
+            self.attn = CausalSelfAttention(d_model, n_heads, dropout)
+            
         self.ln2 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -58,7 +108,8 @@ class TransformerModels(nn.Module):
     Uses parameter replication approach similar to LeNetModels.
     """
     
-    def __init__(self, vocab_size, d_model, n_layers, n_heads, d_ff, max_len, dropout, model_count, device='cuda'):
+    def __init__(self, vocab_size, d_model, n_layers, n_heads, d_ff, max_len, dropout, model_count, 
+                 device='cuda', use_rotary=False, rotary_theta=10000.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -69,6 +120,14 @@ class TransformerModels(nn.Module):
         self.dropout = dropout
         self.model_count = model_count
         self.device = device
+        self.use_rotary = use_rotary
+        self.rotary_theta = rotary_theta
+        
+        # Check that head dimension is even when using rotary encoding
+        head_dim = d_model // n_heads
+        if use_rotary and head_dim % 2 != 0:
+            raise ValueError(f"Head dimension must be even for rotary encoding. "
+                           f"Got d_model={d_model}, n_heads={n_heads}, head_dim={head_dim}")
         
         # Dropout layer
         self.dropout_layer = nn.Dropout(dropout)
@@ -77,8 +136,16 @@ class TransformerModels(nn.Module):
         # Token embeddings - replicated for each model
         self.token_emb = nn.Parameter(torch.randn(model_count, vocab_size, d_model))
         
-        # Position embeddings - replicated for each model
-        self.pos_emb = nn.Parameter(torch.randn(model_count, max_len, d_model))
+        # Position embeddings - only used when not using rotary encoding
+        if not use_rotary:
+            self.pos_emb = nn.Parameter(torch.randn(model_count, max_len, d_model))
+        else:
+            self.pos_emb = None
+            # Precompute rotary frequencies for each model
+            self.register_buffer(
+                'freqs_cis', 
+                precompute_freqs_cis(head_dim, max_len, rotary_theta, device).unsqueeze(0).repeat(model_count, 1, 1)
+            )
         
         # Transformer blocks parameters - we'll store all parameters directly
         self.transformer_params = nn.ParameterDict()
@@ -127,14 +194,19 @@ class TransformerModels(nn.Module):
         """Initialize parameters for multi-model setup."""
         # Initialize all models with same weights initially
         with torch.no_grad():
-            # Token and position embeddings
+            # Token embeddings
             nn.init.normal_(self.token_emb, std=0.02)
-            nn.init.normal_(self.pos_emb, std=0.02)
             
-            # Make all models start with same weights
+            # Position embeddings (only if not using rotary)
+            if not self.use_rotary:
+                nn.init.normal_(self.pos_emb, std=0.02)
+                # Make all models start with same weights
+                for i in range(1, self.model_count):
+                    self.pos_emb[i] = self.pos_emb[0].clone()
+            
+            # Make all models start with same token embeddings
             for i in range(1, self.model_count):
                 self.token_emb[i] = self.token_emb[0].clone()
-                self.pos_emb[i] = self.pos_emb[0].clone()
             
             # Initialize transformer parameters
             for name, param in self.transformer_params.items():
@@ -180,6 +252,12 @@ class TransformerModels(nn.Module):
         qkv = qkv.reshape(B, T, self.n_heads, 3 * self.d_model // self.n_heads).transpose(1, 2)
         q, k, v = qkv.chunk(3, dim=-1)  # Each: (B, n_heads, T, d_k)
         
+        # Apply rotary positional encoding if enabled
+        if self.use_rotary:
+            # Get frequencies for this model and current sequence length
+            freqs = self.freqs_cis[model_idx, :T, :]  # (T, d_k//2)
+            q, k = apply_rotary_emb(q, k, freqs)
+        
         # Compute attention
         d_k = self.d_model // self.n_heads
         attn_scores = (q @ k.transpose(-2, -1)) / (d_k ** 0.5)
@@ -219,16 +297,20 @@ class TransformerModels(nn.Module):
             # Token embeddings
             token_emb = F.embedding(x, self.token_emb[model_idx])  # (B, T, d_model)
             
-            # Position embeddings
-            if position_ids is not None:
-                # Use custom position indices
-                pos_emb = self.pos_emb[model_idx][position_ids]  # (B, T, d_model)
+            # Position embeddings (only if not using rotary encoding)
+            if not self.use_rotary:
+                if position_ids is not None:
+                    # Use custom position indices
+                    pos_emb = self.pos_emb[model_idx][position_ids]  # (B, T, d_model)
+                else:
+                    # Standard sequential positions
+                    pos_emb = self.pos_emb[model_idx][:T].unsqueeze(0).expand(B, -1, -1)  # (B, T, d_model)
+                
+                # Add embeddings
+                hidden = token_emb + pos_emb  # (B, T, d_model)
             else:
-                # Standard sequential positions
-                pos_emb = self.pos_emb[model_idx][:T].unsqueeze(0).expand(B, -1, -1)  # (B, T, d_model)
-            
-            # Add embeddings
-            hidden = token_emb + pos_emb  # (B, T, d_model)
+                # For rotary encoding, only use token embeddings
+                hidden = token_emb  # (B, T, d_model)
             
             # Pass through transformer blocks
             for layer_idx in range(self.n_layers):
@@ -441,8 +523,11 @@ class TransformerModels(nn.Module):
             n_heads=self.n_heads,
             d_ff=self.d_ff,
             max_len=self.max_len,
+            dropout=self.dropout,
             model_count=model_count,
-            device=self.device
+            device=self.device,
+            use_rotary=self.use_rotary,
+            rotary_theta=self.rotary_theta
         )
         new_model.load_state_dict(self.get_weights_by_idx(idx))
         return new_model

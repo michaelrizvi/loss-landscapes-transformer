@@ -7,7 +7,125 @@ import torch.nn.functional as F
 from itertools import chain
 import random
 
-def calculate_loss_acc(data, labels, model, loss_func, batch_size=None):
+def precompute_freqs_cis(dim: int, seq_len: int, theta: float = 10000.0, device: str = 'cuda'):
+    """
+    Precompute complex exponentials for rotary positional encoding.
+    
+    Args:
+        dim: Head dimension (must be even)
+        seq_len: Maximum sequence length
+        theta: Base for frequency computation
+        device: Device to store the frequencies on
+        
+    Returns:
+        Complex tensor of shape (seq_len, dim//2) containing rotary frequencies
+    """
+    assert dim % 2 == 0, f"Head dimension must be even, got {dim}"
+    
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, freqs)  # shape: (seq_len, dim/2)
+    return torch.polar(torch.ones_like(freqs), freqs)  # complex tensor
+
+def compute_freqs_cis_dynamic(dim: int, seq_len: int, theta: float = 10000.0, device: str = 'cuda'):
+    """
+    Dynamically compute complex exponentials for rotary positional encoding.
+    This version computes frequencies on-the-fly for the exact sequence length needed.
+    
+    Args:
+        dim: Head dimension (must be even)
+        seq_len: Current sequence length
+        theta: Base for frequency computation
+        device: Device to store the frequencies on
+        
+    Returns:
+        Complex tensor of shape (seq_len, dim//2) containing rotary frequencies
+    """
+    assert dim % 2 == 0, f"Head dimension must be even, got {dim}"
+    
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, freqs)  # shape: (seq_len, dim/2)
+    return torch.polar(torch.ones_like(freqs), freqs)  # complex tensor
+
+def apply_rotary_emb(q, k, freqs_cis):
+    """
+    Apply rotary positional encoding to query and key tensors.
+    
+    Args:
+        q: Query tensor of shape (..., seq_len, dim)
+        k: Key tensor of shape (..., seq_len, dim)
+        freqs_cis: Precomputed frequencies of shape (seq_len, dim//2)
+        
+    Returns:
+        Tuple of (rotated_q, rotated_k) with same shapes as input
+    """
+    # Get dimensions
+    *prefix, seq_len, dim = q.shape
+    
+    # Ensure we have the right number of frequencies
+    if freqs_cis.shape[0] < seq_len:
+        # If we need more frequencies than precomputed, compute them dynamically
+        device = q.device
+        freqs_cis = compute_freqs_cis_dynamic(dim, seq_len, device=device)
+    else:
+        # Use the precomputed frequencies for the current sequence length
+        freqs_cis = freqs_cis[:seq_len]
+    
+    # Reshape for complex operations - convert pairs of real numbers to complex
+    q_pairs = q.reshape(*prefix, seq_len, dim // 2, 2)
+    k_pairs = k.reshape(*prefix, seq_len, dim // 2, 2)
+    
+    # Convert to complex tensors
+    q_complex = torch.view_as_complex(q_pairs)  # (..., seq_len, dim//2)
+    k_complex = torch.view_as_complex(k_pairs)  # (..., seq_len, dim//2)
+    
+    # Broadcast frequencies to match query/key dimensions
+    freqs = freqs_cis.view(*(1,) * len(prefix), seq_len, dim // 2)
+    
+    # Apply rotation
+    q_rotated = torch.view_as_real(q_complex * freqs)  # (..., seq_len, dim//2, 2)
+    k_rotated = torch.view_as_real(k_complex * freqs)  # (..., seq_len, dim//2, 2)
+    
+    # Flatten back to original shape
+    q_out = q_rotated.flatten(-2)  # (..., seq_len, dim)
+    k_out = k_rotated.flatten(-2)  # (..., seq_len, dim)
+    
+    return q_out, k_out
+
+def get_loss_function(model_arch, pad_token=103):
+    """
+    Returns appropriate loss function based on model architecture.
+    For transformers, returns a custom loss that excludes padding tokens.
+    For other models, returns standard CrossEntropyLoss.
+    """
+    if model_arch == "transformer":
+        def transformer_loss_func(predictions, targets, pad_token=pad_token):
+            """
+            Custom loss function for transformers that excludes padding tokens.
+            Works with flattened inputs as expected by calculate_loss_acc.
+            """
+            # Create mask to exclude padding tokens
+            mask = (targets != pad_token)
+            
+            # Compute cross entropy only on non-padding tokens
+            ce_loss = nn.functional.cross_entropy(predictions, targets, reduction='none')
+            
+            # Zero out loss for padding tokens
+            masked_loss = ce_loss * mask.float()
+            
+            return masked_loss
+        
+        return transformer_loss_func
+    else:
+        return nn.CrossEntropyLoss(reduction='none')
+
+def calculate_loss_acc(data, labels, model, loss_func, batch_size=None, sep_token=102, pad_token=103):
+    """
+    Calculate loss and accuracy.
+    For transformers, evaluates on the entire sequence using next-token prediction.
+    This is kept for backward compatibility with existing code.
+    """
     if batch_size is None:
         pred = model(data)  # pred.shape = (# of examples, # model counts , output_dim)
     else:
@@ -18,8 +136,17 @@ def calculate_loss_acc(data, labels, model, loss_func, batch_size=None):
         pred = torch.cat(pred, dim=0)
     if len(pred.shape) == 4:  # Transformer case: (batch_size, model_count, seq_len, vocab_size)
         n, m, t, o = pred.shape
-        loss = loss_func(pred.view(n * m * t, o), labels.repeat(1, m).view(-1)).view(n, m, t).mean(dim=(0, 2))
-        acc = (pred.view(n * m * t, o).argmax(dim=1) == labels.repeat(1, m).view(-1)).view(n, m, t).float().mean(dim=(0, 2))
+        # For next-token prediction: predictions are for positions 0:t-1, targets are positions 1:t
+        # So we need to align them properly
+        pred_shifted = pred[:, :, :-1, :]  # Remove last prediction (n, m, t-1, o)
+        labels_shifted = labels[:, 1:]     # Remove first token from targets (n, t-1)
+        
+        # Reshape for loss computation
+        pred_flat = pred_shifted.reshape(n * m * (t-1), o)
+        labels_flat = labels_shifted.repeat(1, m).view(-1)
+        
+        loss = loss_func(pred_flat, labels_flat).view(n, m, t-1).mean(dim=(0, 2))
+        acc = (pred_flat.argmax(dim=1) == labels_flat).view(n, m, t-1).float().mean(dim=(0, 2))
     else:  # Original case: (batch_size, model_count, output_dim)
         n, m, o = pred.shape
         loss = loss_func(pred.view(n * m, o), labels.repeat_interleave(m)).view(n, m).mean(dim=0)
@@ -29,12 +156,18 @@ def calculate_loss_acc(data, labels, model, loss_func, batch_size=None):
 def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_size=None, sep_token=102, pad_token=103):
     """
     Calculate loss, token-level accuracy, and exact match accuracy.
-    For transformers, exact match only considers the counting output part after the separator.
+    For transformers, only evaluates on the counting output part after the separator.
+    
+    Dataset format understanding:
+    - Input sequence: [min_val, max_val, sep_token, min_val, min_val+1, ..., max_val, pad, pad, ...]
+    - Target sequence (next-token prediction): [max_val, sep_token, min_val, min_val+1, ..., max_val, pad, pad, ...]
+    
+    We only want to evaluate loss/accuracy on the counting part: [min_val, min_val+1, ..., max_val]
     
     Returns:
-        loss: Loss per model
-        token_acc: Token-level accuracy per model  
-        exact_match_acc: Exact match accuracy per model (only for counting output)
+        loss: Loss per model (only on counting tokens)
+        token_acc: Token-level accuracy per model (only on counting tokens)
+        exact_match_acc: Exact match accuracy per model (1 if entire counting sequence is correct)
     """
     if batch_size is None:
         pred = model(data)  # pred.shape = (# of examples, # model counts , output_dim)
@@ -48,29 +181,25 @@ def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_si
     if len(pred.shape) == 4:  # Transformer case: (batch_size, model_count, seq_len, vocab_size)
         n, m, t, o = pred.shape
         
-        # Loss computation
-        loss = loss_func(pred.view(n * m * t, o), labels.repeat(1, m).view(-1)).view(n, m, t).mean(dim=(0, 2))
+        # Get predicted tokens
+        pred_tokens = pred.argmax(dim=-1)  # (batch_size, model_count, seq_len)
+        # Get predicted tokens
+        pred_tokens = pred.argmax(dim=-1)  # (batch_size, model_count, seq_len)
         
-        # Token-level and exact match accuracy: only check counting output after separator
-        token_correct = (pred.view(n * m * t, o).argmax(dim=1) == labels.repeat(1, m).view(-1)).view(n, m, t)
-        exact_match_correct_list = []
+        # Initialize lists to store results
+        loss_list = []
         token_acc_list = []
+        exact_match_correct_list = []
         
         for batch_idx in range(n):
-            # Find separator position in the input sequence for this batch item
-            input_seq = data[batch_idx]  # Input sequence for this batch item
             target_seq = labels[batch_idx]  # Target sequence for this batch item
-            sep_positions = (input_seq == sep_token).nonzero(as_tuple=True)[0]
+            
+            # Find separator position in target sequence
+            sep_positions = (target_seq == sep_token).nonzero(as_tuple=True)[0]
             
             if len(sep_positions) > 0:
-                sep_pos = sep_positions[0].item()  # Position of separator in input
-                # Find separator in target sequence (it's shifted by -1 due to next-token prediction)
-                target_sep_positions = (target_seq == sep_token).nonzero(as_tuple=True)[0]
-                if len(target_sep_positions) > 0:
-                    target_sep_pos = target_sep_positions[0].item()
-                    counting_start = target_sep_pos + 1  # Start after separator in target
-                else:
-                    counting_start = sep_pos  # Fallback to input position
+                sep_pos = sep_positions[0].item()
+                counting_start = sep_pos + 1  # Start after separator in target
                 
                 # Find where counting ends (before padding)
                 counting_end = t  # Default to end of sequence
@@ -78,27 +207,47 @@ def calculate_loss_acc_with_exact_match(data, labels, model, loss_func, batch_si
                 if len(pad_positions) > 0:
                     counting_end = pad_positions[0].item()
                 
-                # Check if counting part is correct for each model
+                # Only evaluate if there's a valid counting region
                 if counting_start < counting_end:
-                    counting_token_correct = token_correct[batch_idx, :, counting_start:counting_end]
-                    counting_exact_correct = counting_token_correct.all(dim=1)  # All tokens correct
-                    counting_token_acc = counting_token_correct.float().mean(dim=1)  # Average token accuracy
+                    # Extract counting region from predictions and targets
+                    target_counting = target_seq[counting_start:counting_end]  # (counting_len,)
+                    pred_counting = pred[batch_idx, :, counting_start:counting_end, :]  # (model_count, counting_len, vocab_size)
+                    pred_tokens_counting = pred_tokens[batch_idx, :, counting_start:counting_end]  # (model_count, counting_len)
+                    
+                    # Compute loss only on counting tokens
+                    counting_len = counting_end - counting_start
+                    loss_counting = loss_func(
+                        pred_counting.reshape(m * counting_len, o),
+                        target_counting.repeat(m)
+                    ).view(m, counting_len).mean(dim=1)  # Average over counting tokens for each model
+                    
+                    # Compute token accuracy only on counting tokens
+                    token_correct_counting = (pred_tokens_counting == target_counting.unsqueeze(0))  # (model_count, counting_len)
+                    token_acc_counting = token_correct_counting.float().mean(dim=1)  # Average over counting tokens
+                    
+                    # Compute exact match (all counting tokens correct)
+                    exact_match_counting = token_correct_counting.all(dim=1)  # (model_count,)
+                    
                 else:
-                    counting_exact_correct = torch.ones(m, dtype=torch.bool, device=token_correct.device)  # Empty counting = correct
-                    counting_token_acc = torch.ones(m, dtype=torch.float, device=token_correct.device)  # Empty counting = 100%
+                    # Empty counting region - perfect scores
+                    loss_counting = torch.zeros(m, device=pred.device)
+                    token_acc_counting = torch.ones(m, device=pred.device)
+                    exact_match_counting = torch.ones(m, dtype=torch.bool, device=pred.device)
             else:
-                # No separator found, consider the entire sequence (fallback)
-                counting_exact_correct = token_correct[batch_idx, :, :].all(dim=1)
-                counting_token_acc = token_correct[batch_idx, :, :].float().mean(dim=1)
+                # No separator found - fallback to evaluating entire sequence
+                loss_counting = loss_func(pred[batch_idx].view(m * t, o), target_seq.repeat(m)).view(m, t).mean(dim=1)
+                token_correct_full = (pred_tokens[batch_idx] == target_seq.unsqueeze(0))
+                token_acc_counting = token_correct_full.float().mean(dim=1)
+                exact_match_counting = token_correct_full.all(dim=1)
             
-            exact_match_correct_list.append(counting_exact_correct)
-            token_acc_list.append(counting_token_acc)
+            loss_list.append(loss_counting)
+            token_acc_list.append(token_acc_counting)
+            exact_match_correct_list.append(exact_match_counting)
         
-        exact_match_correct = torch.stack(exact_match_correct_list, dim=0)  # (n, m)
-        exact_match_acc = exact_match_correct.float().mean(dim=0)  # Average over batch
-        
-        token_acc_per_batch = torch.stack(token_acc_list, dim=0)  # (n, m)
-        token_acc = token_acc_per_batch.mean(dim=0)  # Average over batch
+        # Average across batch
+        loss = torch.stack(loss_list, dim=0).mean(dim=0)  # (model_count,)
+        token_acc = torch.stack(token_acc_list, dim=0).mean(dim=0)  # (model_count,)
+        exact_match_acc = torch.stack(exact_match_correct_list, dim=0).float().mean(dim=0)  # (model_count,)
         
     else:  # Original case: (batch_size, model_count, output_dim)
         n, m, o = pred.shape
@@ -819,30 +968,3 @@ if __name__ == "__main__":
         x = F.conv2d(x, model.fc3.weight[2*i:2*(i+1)], model.fc3.bias[2*i:2*(i+1)])
 
         print(f"this should be close to zero: {(x.flatten() - out[:, i:i+1].flatten()).abs().max().cpu().item(): 0.3f}" )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
